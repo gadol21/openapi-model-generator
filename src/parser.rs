@@ -996,13 +996,29 @@ fn resolve_union_variants(
                 _ => {
                     let (fields, inline_models) =
                         extract_fields_from_schema(schema_ref, all_schemas)?;
-                    let variant_name = format!("Variant{index}");
-                    variants.push(UnionVariant {
-                        name: variant_name,
+                    models.extend(inline_models);
+
+                    let enum_name = to_pascal_case(name);
+                    let variant_suffix = schema
+                        .schema_data
+                        .title
+                        .as_deref()
+                        .map(to_pascal_case)
+                        .unwrap_or_else(|| format!("Variant{index}"));
+
+                    let struct_name = format!("{enum_name}{variant_suffix}");
+                    models.push(ModelType::Struct(Model {
+                        name: struct_name.clone(),
                         fields,
+                        custom_attrs: extract_custom_attrs(schema),
+                        description: schema.schema_data.description.clone(),
+                    }));
+
+                    variants.push(UnionVariant {
+                        name: struct_name,
+                        fields: vec![],
                         primitive_type: None,
                     });
-                    models.extend(inline_models);
                 }
             },
         }
