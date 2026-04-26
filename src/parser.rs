@@ -30,7 +30,7 @@ struct FieldInfo {
 /// Converts camelCase to PascalCase
 /// Example: "createRole" -> "CreateRole", "listRoles" -> "ListRoles", "listRoles-Input" -> "ListRolesInput"
 pub(crate) fn to_pascal_case(input: &str) -> String {
-    input
+    let result: String = input
         .split(&['-', '_'][..])
         .filter(|s| !s.is_empty())
         .map(|s| {
@@ -40,7 +40,12 @@ pub(crate) fn to_pascal_case(input: &str) -> String {
                 None => String::new(),
             }
         })
-        .collect::<String>()
+        .collect();
+    if result.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("_{result}")
+    } else {
+        result
+    }
 }
 
 /// Extracts custom Rust attributes from x-rust-attrs extension
