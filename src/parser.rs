@@ -258,25 +258,9 @@ fn parse_schema_to_model_type(
                 SchemaKind::Type(Type::Object(obj)) => {
                     // Special case: object with only additionalProperties (no regular properties)
                     if obj.properties.is_empty() && obj.additional_properties.is_some() {
-                        let hashmap_type = match &obj.additional_properties {
-                            Some(additional_props) => match additional_props {
-                                openapiv3::AdditionalProperties::Any(_) => {
-                                    "std::collections::HashMap<String, serde_json::Value>"
-                                        .to_string()
-                                }
-                                openapiv3::AdditionalProperties::Schema(schema_ref) => {
-                                    let (inner_type, _) =
-                                        extract_type_and_format(schema_ref, all_schemas)?;
-                                    format!("std::collections::HashMap<String, {inner_type}>")
-                                }
-                            },
-                            None => {
-                                "std::collections::HashMap<String, serde_json::Value>".to_string()
-                            }
-                        };
                         return Ok(vec![ModelType::TypeAlias(TypeAliasModel {
                             name: to_pascal_case(name),
-                            target_type: hashmap_type,
+                            target_type: "&'a RawValue".to_string(),
                             description: schema.schema_data.description.clone(),
                             custom_attrs: extract_custom_attrs(schema),
                         })]);
@@ -638,16 +622,16 @@ fn extract_type_and_format(
                         Ok(("DateTime<Utc>".to_string(), "date-time".to_string()))
                     }
                     StringFormat::Date => Ok(("NaiveDate".to_string(), "date".to_string())),
-                    _ => Ok(("String".to_string(), format!("{fmt:?}"))),
+                    _ => Ok(("&'a RawValue".to_string(), format!("{fmt:?}"))),
                 },
                 VariantOrUnknownOrEmpty::Unknown(unknown_format) => {
                     if unknown_format.to_lowercase() == "uuid" {
                         Ok(("Uuid".to_string(), "uuid".to_string()))
                     } else {
-                        Ok(("String".to_string(), unknown_format.clone()))
+                        Ok(("&'a RawValue".to_string(), unknown_format.clone()))
                     }
                 }
-                _ => Ok(("String".to_string(), "string".to_string())),
+                _ => Ok(("&'a RawValue".to_string(), "string".to_string())),
             },
             SchemaKind::Type(Type::Integer(_)) => Ok(("i64".to_string(), "integer".to_string())),
             SchemaKind::Type(Type::Number(_)) => Ok(("f64".to_string(), "number".to_string())),
@@ -668,13 +652,13 @@ fn extract_type_and_format(
                         ),
                     }
                 } else {
-                    Ok(("serde_json::Value".to_string(), "array".to_string()))
+                    Ok(("&'a RawValue".to_string(), "array".to_string()))
                 }
             }
             SchemaKind::Type(Type::Object(_obj)) => {
-                Ok(("serde_json::Value".to_string(), "object".to_string()))
+                Ok(("&'a RawValue".to_string(), "object".to_string()))
             }
-            _ => Ok(("serde_json::Value".to_string(), "unknown".to_string())),
+            _ => Ok(("&'a RawValue".to_string(), "unknown".to_string())),
         },
     }
 }
@@ -742,30 +726,21 @@ fn extract_field_info(
                     if obj.properties.is_empty() {
                         if let Some(additional_props) = &obj.additional_properties {
                             match additional_props {
-                                AdditionalProperties::Schema(schema) => {
-                                    let (value_type, _) =
-                                        extract_type_and_format(&schema.clone(), all_schemas)?;
-
-                                    field_type = format!(
-                                        "std::collections::HashMap<String, {}>",
-                                        value_type
-                                    );
+                                AdditionalProperties::Schema(_) => {
+                                    field_type = "&'a RawValue".to_string();
                                 }
 
                                 AdditionalProperties::Any(true) => {
-                                    field_type =
-                                        "std::collections::HashMap<String, serde_json::Value>"
-                                            .to_string();
+                                    field_type = "&'a RawValue".to_string();
                                 }
 
                                 AdditionalProperties::Any(false) => {
-                                    // technically: no additional props allowed
-                                    field_type = "serde_json::Value".to_string();
+                                    field_type = "&'a RawValue".to_string();
                                 }
                             }
                             None
                         } else {
-                            field_type = "serde_json::Value".to_string();
+                            field_type = "&'a RawValue".to_string();
                             None
                         }
                     } else {
@@ -840,24 +815,13 @@ fn resolve_all_of_fields(
     fn less_value(fields: Vec<Field>, all_fields: &mut IndexMap<String, Field>) {
         for field in fields {
             if let Some(existing_field) = all_fields.get_mut(&field.name) {
-                // Value
-                if existing_field.field_type == "serde_json::Value" {
+                if existing_field.field_type == "&'a RawValue" {
                     *existing_field = field;
-                } else if existing_field.field_type == "Option<serde_json::Value>" {
+                } else if existing_field.field_type == "Option<&'a RawValue>" {
                     existing_field.field_type = format!("Option<{}>", field.field_type);
-                // HashMap Value
-                } else if existing_field.field_type
-                    == "std::collections::HashMap<String, serde_json::Value>"
-                {
-                    *existing_field = field;
-                } else if existing_field.field_type
-                    == "Option<std::collections::HashMap<String, serde_json::Value>>"
-                {
-                    existing_field.field_type = format!("Option<{}>", field.field_type);
-                // Vec Value
-                } else if existing_field.field_type == "Vec<serde_json::Value>" {
+                } else if existing_field.field_type == "Vec<&'a RawValue>" {
                     existing_field.field_type = format!("Vec<{}>", field.field_type);
-                } else if existing_field.field_type == "Option<Vec<serde_json::Value>>" {
+                } else if existing_field.field_type == "Option<Vec<&'a RawValue>>" {
                     existing_field.field_type = format!("Option<Vec<{}>>", field.field_type);
                 }
             } else {
@@ -999,9 +963,9 @@ fn resolve_union_variants(
             ReferenceOr::Item(schema) => match &schema.schema_kind {
                 SchemaKind::Type(Type::String(_)) => {
                     variants.push(UnionVariant {
-                        name: "String".to_string(),
+                        name: "RawValue".to_string(),
                         fields: vec![],
-                        primitive_type: Some("String".to_string()),
+                        primitive_type: Some("&'a RawValue".to_string()),
                     });
                 }
 
@@ -1206,7 +1170,7 @@ mod tests {
         if let Some(ModelType::Struct(model)) = inline_model {
             assert_eq!(model.fields.len(), 2);
             assert_eq!(model.fields[0].name, "name");
-            assert_eq!(model.fields[0].field_type, "String");
+            assert_eq!(model.fields[0].field_type, "&'a RawValue");
             assert!(model.fields[0].is_required);
 
             assert_eq!(model.fields[1].name, "value");
@@ -1713,12 +1677,11 @@ mod tests {
                 assert!(version_field.is_some(), "Expected version field");
                 assert_eq!(version_field.unwrap().field_type, "semver::Version");
 
-                // Verify other fields have regular types
                 let title_field = model.fields.iter().find(|f| f.name == "title");
-                assert_eq!(title_field.unwrap().field_type, "String");
+                assert_eq!(title_field.unwrap().field_type, "&'a RawValue");
 
                 let content_field = model.fields.iter().find(|f| f.name == "content");
-                assert_eq!(content_field.unwrap().field_type, "String");
+                assert_eq!(content_field.unwrap().field_type, "&'a RawValue");
             }
             _ => panic!("Expected Struct"),
         }
@@ -1915,7 +1878,7 @@ mod tests {
                     .fields
                     .iter()
                     .find(|f| f.name == "regular_field");
-                assert_eq!(regular_field.unwrap().field_type, "String");
+                assert_eq!(regular_field.unwrap().field_type, "&'a RawValue");
 
                 // Verify nullable flags for required/optional fields
                 assert!(!id_field.unwrap().is_nullable, "id should not be nullable");

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use crate::{
@@ -13,6 +14,7 @@ bitflags::bitflags! {
         const UUID = 0b00000001;
         const DATETIME = 0b00000010;
         const DATE = 0b00000100;
+        const RAW_VALUE = 0b00001000;
     }
 
     /// Choose what type of structs you want to generate:
@@ -45,6 +47,7 @@ fn create_header() -> String {
             r#"
 //!
 //! Generated from an OAS specification by {}(v{})
+//! Requires serde_json with the "raw_value" feature enabled.
 //!
 
 "#,
@@ -155,13 +158,105 @@ fn generate_custom_attrs(custom_attrs: &Option<Vec<String>>) -> String {
     }
 }
 
+fn types_needing_lifetime(models: &[ModelType]) -> HashSet<String> {
+    let mut deps: Vec<(String, Vec<String>)> = Vec::new();
+    let mut needs_lifetime: HashSet<String> = HashSet::new();
+
+    for model in models {
+        match model {
+            ModelType::Struct(m) => {
+                let mut field_types = Vec::new();
+                for field in &m.fields {
+                    if field.field_type.contains("RawValue") {
+                        needs_lifetime.insert(m.name.clone());
+                    } else {
+                        field_types.push(field.field_type.clone());
+                    }
+                }
+                deps.push((m.name.clone(), field_types));
+            }
+            ModelType::Composition(c) => {
+                let mut field_types = Vec::new();
+                for field in &c.all_fields {
+                    if field.field_type.contains("RawValue") {
+                        needs_lifetime.insert(c.name.clone());
+                    } else {
+                        field_types.push(field.field_type.clone());
+                    }
+                }
+                deps.push((c.name.clone(), field_types));
+            }
+            ModelType::Union(u) => {
+                let mut variant_types = Vec::new();
+                for variant in &u.variants {
+                    if let Some(pt) = &variant.primitive_type {
+                        if pt.contains("RawValue") {
+                            needs_lifetime.insert(u.name.clone());
+                        }
+                    } else {
+                        variant_types.push(variant.name.clone());
+                    }
+                    for field in &variant.fields {
+                        if field.field_type.contains("RawValue") {
+                            needs_lifetime.insert(u.name.clone());
+                        } else {
+                            variant_types.push(field.field_type.clone());
+                        }
+                    }
+                }
+                deps.push((u.name.clone(), variant_types));
+            }
+            ModelType::TypeAlias(t) => {
+                if t.target_type.contains("RawValue") {
+                    needs_lifetime.insert(t.name.clone());
+                }
+                deps.push((t.name.clone(), vec![t.target_type.clone()]));
+            }
+            ModelType::Enum(_) => {}
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for (name, ref_types) in &deps {
+            if !needs_lifetime.contains(name) {
+                for ref_type in ref_types {
+                    if needs_lifetime.contains(ref_type) {
+                        needs_lifetime.insert(name.clone());
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    needs_lifetime
+}
+
+fn field_needs_borrow(field_type: &str, needs_lifetime: &HashSet<String>) -> bool {
+    field_type.contains("RawValue") || needs_lifetime.contains(field_type)
+}
+
+fn type_with_lifetime(field_type: &str, needs_lifetime: &HashSet<String>) -> String {
+    if needs_lifetime.contains(field_type) && !field_type.contains("'a") {
+        format!("{field_type}<'a>")
+    } else {
+        field_type.to_string()
+    }
+}
+
 pub fn generate_models(
     models: &[ModelType],
     requests: &[RequestModel],
     responses: &[ResponseModel],
     mode: GenerateMode,
 ) -> Result<String> {
-    // First, generate all model code to determine which imports are needed
+    let lifetime_types = types_needing_lifetime(models);
+
     let mut models_code = String::new();
     let mut required_uses = RequiredUses::empty();
     let mut needs_validator = false;
@@ -173,43 +268,51 @@ pub fn generate_models(
                     model,
                     &mut required_uses,
                     &mut needs_validator,
+                    &lifetime_types,
                 )?);
             }
             ModelType::Union(union) => {
-                models_code.push_str(&generate_union(union)?);
+                models_code.push_str(&generate_union(union, &lifetime_types)?);
             }
             ModelType::Composition(comp) => {
-                models_code.push_str(&generate_composition(comp, &mut required_uses)?);
+                models_code.push_str(&generate_composition(
+                    comp,
+                    &mut required_uses,
+                    &lifetime_types,
+                )?);
             }
             ModelType::Enum(enum_model) => {
                 models_code.push_str(&generate_enum(enum_model)?);
             }
             ModelType::TypeAlias(type_alias) => {
-                models_code.push_str(&generate_type_alias(type_alias)?);
+                models_code.push_str(&generate_type_alias(type_alias, &lifetime_types)?);
             }
         }
     }
 
     if mode.contains(GenerateMode::REQUESTS) {
         for request in requests {
-            models_code.push_str(&generate_request_model(request)?);
+            models_code.push_str(&generate_request_model(request, &lifetime_types)?);
         }
     }
 
     if mode.contains(GenerateMode::RESPONSES) {
         for response in responses {
-            models_code.push_str(&generate_response_model(response)?);
+            models_code.push_str(&generate_response_model(response, &lifetime_types)?);
         }
     }
 
-    // Determine which imports are actually needed
     let needs_uuid = required_uses.contains(RequiredUses::UUID);
     let needs_datetime = required_uses.contains(RequiredUses::DATETIME);
     let needs_date = required_uses.contains(RequiredUses::DATE);
+    let needs_raw_value = required_uses.contains(RequiredUses::RAW_VALUE);
 
-    // Build final output with only necessary imports
     let mut output = create_header();
     output.push_str("use serde::{Serialize, Deserialize};\n");
+
+    if needs_raw_value {
+        output.push_str("use serde_json::value::RawValue;\n");
+    }
 
     if needs_uuid {
         output.push_str("use uuid::Uuid;\n");
@@ -318,8 +421,10 @@ fn generate_model(
     model: &Model,
     required_uses: &mut RequiredUses,
     needs_validator: &mut bool,
+    lifetime_types: &HashSet<String>,
 ) -> Result<String> {
     let mut output = String::new();
+    let has_lifetime = lifetime_types.contains(&model.name);
 
     output.push_str(&generate_description_docs(
         &model.description,
@@ -329,15 +434,12 @@ fn generate_model(
 
     output.push_str(&generate_custom_attrs(&model.custom_attrs));
 
-    // Check if any fields have validation rules
     let has_validation = model.fields.iter().any(|f| f.validation_rules.is_some());
 
-    // Mark that we need validator import if any field has validation
     if has_validation {
         *needs_validator = true;
     }
 
-    // Only add default derive if custom_attrs doesn't already contain a derive directive
     if !has_custom_derive(&model.custom_attrs) {
         if has_validation {
             output.push_str("#[derive(Debug, Clone, Serialize, Deserialize, Validator)]\n");
@@ -346,7 +448,11 @@ fn generate_model(
         }
     }
 
-    output.push_str(&format!("pub struct {} {{\n", model.name));
+    if has_lifetime {
+        output.push_str(&format!("pub struct {}<'a> {{\n", model.name));
+    } else {
+        output.push_str(&format!("pub struct {} {{\n", model.name));
+    }
 
     for field in &model.fields {
         let field_type = match field.field_type.as_str() {
@@ -362,31 +468,35 @@ fn generate_model(
                 *required_uses |= RequiredUses::UUID;
                 "Uuid"
             }
+            t if t.contains("RawValue") => {
+                *required_uses |= RequiredUses::RAW_VALUE;
+                t
+            }
             _ => &field.field_type,
         };
+
+        let field_type_str = type_with_lifetime(field_type, lifetime_types);
+        let needs_borrow = field_needs_borrow(field_type, lifetime_types);
 
         let mut lowercased_name = to_snake_case(field.name.as_str());
         if is_reserved_word(&lowercased_name) {
             lowercased_name = format!("r#{lowercased_name}")
         }
 
-        // Add field description if present
         output.push_str(&generate_description_docs(&field.description, "", "    "));
 
-        // Field-level custom attributes (e.g. #[serde(rename = "...")])
         if let Some(attrs) = &field.custom_attrs {
             for attr in attrs {
                 output.push_str(&format!("    {attr}\n"));
             }
         }
 
-        // Calculate full field type before generating validator attributes
         let is_optional = !field.is_required || field.is_nullable;
 
         let base_type = if field.is_array_ref {
-            format!("Vec<{field_type}>")
+            format!("Vec<{field_type_str}>")
         } else {
-            field_type.to_string()
+            field_type_str.to_string()
         };
 
         let full_field_type = if is_optional {
@@ -395,17 +505,19 @@ fn generate_model(
             base_type
         };
 
-        // Add validator attributes if the field has validation rules
         if let Some(rules) = &field.validation_rules {
             output.push_str(&generate_validator_attrs(rules, &full_field_type));
         }
 
-        // Only add serde rename if the Rust field name differs from the original field name
+        if needs_borrow {
+            output.push_str("    #[serde(borrow)]\n");
+        }
+
         if lowercased_name != field.name {
             output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field.name));
         }
 
-        if field.should_flatten() {
+        if field.should_flatten() && !field_type.contains("RawValue") {
             output.push_str("    #[serde(flatten)]\n");
         }
 
@@ -416,7 +528,10 @@ fn generate_model(
     Ok(output)
 }
 
-fn generate_request_model(request: &RequestModel) -> Result<String> {
+fn generate_request_model(
+    request: &RequestModel,
+    lifetime_types: &HashSet<String>,
+) -> Result<String> {
     let mut output = String::new();
     tracing::info!("Generating request model");
     tracing::info!("{:#?}", request);
@@ -425,20 +540,33 @@ fn generate_request_model(request: &RequestModel) -> Result<String> {
         return Ok(String::new());
     }
 
+    let schema_has_lifetime = lifetime_types.contains(&request.schema);
+    let schema_type = type_with_lifetime(&request.schema, lifetime_types);
+
     output.push_str(&format!("/// {}\n", request.name));
     output.push_str("#[derive(Debug, Clone, Serialize)]\n");
-    output.push_str(&format!("pub struct {} {{\n", request.name));
-    output.push_str(&format!("    pub body: {},\n", request.schema));
+    if schema_has_lifetime {
+        output.push_str(&format!("pub struct {}<'a> {{\n", request.name));
+        output.push_str("    #[serde(borrow)]\n");
+    } else {
+        output.push_str(&format!("pub struct {} {{\n", request.name));
+    }
+    output.push_str(&format!("    pub body: {},\n", schema_type));
     output.push_str("}\n");
     Ok(output)
 }
 
-fn generate_response_model(response: &ResponseModel) -> Result<String> {
+fn generate_response_model(
+    response: &ResponseModel,
+    lifetime_types: &HashSet<String>,
+) -> Result<String> {
     if response.name.is_empty() || response.name == EMPTY_RESPONSE_NAME {
         return Ok(String::new());
     }
 
     let type_name = format!("{}{}", response.name, response.status_code);
+    let schema_has_lifetime = lifetime_types.contains(&response.schema);
+    let schema_type = type_with_lifetime(&response.schema, lifetime_types);
 
     let mut output = String::new();
 
@@ -449,15 +577,21 @@ fn generate_response_model(response: &ResponseModel) -> Result<String> {
     ));
 
     output.push_str("#[derive(Debug, Clone, Deserialize)]\n");
-    output.push_str(&format!("pub struct {type_name} {{\n"));
-    output.push_str(&format!("    pub body: {},\n", response.schema));
+    if schema_has_lifetime {
+        output.push_str(&format!("pub struct {type_name}<'a> {{\n"));
+        output.push_str("    #[serde(borrow)]\n");
+    } else {
+        output.push_str(&format!("pub struct {type_name} {{\n"));
+    }
+    output.push_str(&format!("    pub body: {},\n", schema_type));
     output.push_str("}\n");
 
     Ok(output)
 }
 
-fn generate_union(union: &UnionModel) -> Result<String> {
+fn generate_union(union: &UnionModel, lifetime_types: &HashSet<String>) -> Result<String> {
     let mut output = String::new();
+    let has_lifetime = lifetime_types.contains(&union.name);
 
     output.push_str(&format!(
         "/// {} ({})\n",
@@ -469,22 +603,36 @@ fn generate_union(union: &UnionModel) -> Result<String> {
     ));
     output.push_str(&generate_custom_attrs(&union.custom_attrs));
 
-    // Only add default derive if custom_attrs doesn't already contain a derive
     if !has_custom_derive(&union.custom_attrs) {
         output.push_str("#[derive(Debug, Clone, Serialize, Deserialize)]\n");
     }
 
-    // Only add default serde(untagged) if custom_attrs doesn't already contain a serde attribute
     if !has_custom_serde(&union.custom_attrs) {
         output.push_str("#[serde(untagged)]\n");
     }
 
-    output.push_str(&format!("pub enum {} {{\n", union.name));
+    if has_lifetime {
+        output.push_str(&format!("pub enum {}<'a> {{\n", union.name));
+    } else {
+        output.push_str(&format!("pub enum {} {{\n", union.name));
+    }
 
     for variant in &union.variants {
         match &variant.primitive_type {
-            Some(t) => output.push_str(&format!("    {}({}),\n", variant.name, t)),
-            None => output.push_str(&format!("    {}({}),\n", variant.name, variant.name)),
+            Some(t) => {
+                let t_str = type_with_lifetime(t, lifetime_types);
+                if field_needs_borrow(t, lifetime_types) {
+                    output.push_str(&format!("    #[serde(borrow)]\n"));
+                }
+                output.push_str(&format!("    {}({}),\n", variant.name, t_str));
+            }
+            None => {
+                let variant_type = type_with_lifetime(&variant.name, lifetime_types);
+                if field_needs_borrow(&variant.name, lifetime_types) {
+                    output.push_str(&format!("    #[serde(borrow)]\n"));
+                }
+                output.push_str(&format!("    {}({}),\n", variant.name, variant_type));
+            }
         }
     }
 
@@ -495,22 +643,26 @@ fn generate_union(union: &UnionModel) -> Result<String> {
 fn generate_composition(
     comp: &CompositionModel,
     required_uses: &mut RequiredUses,
+    lifetime_types: &HashSet<String>,
 ) -> Result<String> {
     let mut output = String::new();
+    let has_lifetime = lifetime_types.contains(&comp.name);
 
     output.push_str(&format!("/// {} (allOf composition)\n", comp.name));
     output.push_str(&generate_custom_attrs(&comp.custom_attrs));
 
-    // Only add default derive if custom_attrs doesn't already contain a derive
     if !has_custom_derive(&comp.custom_attrs) {
         output.push_str("#[derive(Debug, Clone, Serialize, Deserialize)]\n");
     }
 
-    output.push_str(&format!("pub struct {} {{\n", comp.name));
+    if has_lifetime {
+        output.push_str(&format!("pub struct {}<'a> {{\n", comp.name));
+    } else {
+        output.push_str(&format!("pub struct {} {{\n", comp.name));
+    }
 
     for field in &comp.all_fields {
         let field_type = match field.field_type.as_str() {
-            "String" => "String",
             "f64" => "f64",
             "i64" => "i64",
             "bool" => "bool",
@@ -526,40 +678,52 @@ fn generate_composition(
                 *required_uses |= RequiredUses::UUID;
                 "Uuid"
             }
+            t if t.contains("RawValue") => {
+                *required_uses |= RequiredUses::RAW_VALUE;
+                t
+            }
             _ => &field.field_type,
         };
+
+        let field_type_str = type_with_lifetime(field_type, lifetime_types);
+        let needs_borrow = field_needs_borrow(field_type, lifetime_types);
 
         let mut lowercased_name = to_snake_case(field.name.as_str());
         if is_reserved_word(&lowercased_name) {
             lowercased_name = format!("r#{lowercased_name}");
         }
 
-        // Only add serde rename if the Rust field name differs from the original field name
+        if needs_borrow {
+            output.push_str("    #[serde(borrow)]\n");
+        }
+
         if lowercased_name != field.name {
             output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field.name));
         }
 
-        // Field-level custom attributes (e.g. #[serde(rename = "...")])
         if let Some(attrs) = &field.custom_attrs {
             for attr in attrs {
                 output.push_str(&format!("    {attr}\n"));
             }
         }
 
-        // If field references an array, wrap it in Vec<>
         if field.is_array_ref {
             if field.is_required && !field.is_nullable {
-                output.push_str(&format!("    pub {lowercased_name}: Vec<{field_type}>,\n",));
+                output.push_str(&format!(
+                    "    pub {lowercased_name}: Vec<{field_type_str}>,\n",
+                ));
             } else {
                 output.push_str(&format!(
-                    "    pub {lowercased_name}: Option<Vec<{field_type}>>,\n",
+                    "    pub {lowercased_name}: Option<Vec<{field_type_str}>>,\n",
                 ));
             }
         } else if field.is_required && !field.is_nullable {
-            output.push_str(&format!("    pub {lowercased_name}: {field_type},\n",));
+            output.push_str(&format!(
+                "    pub {lowercased_name}: {field_type_str},\n",
+            ));
         } else {
             output.push_str(&format!(
-                "    pub {lowercased_name}: Option<{field_type}>,\n",
+                "    pub {lowercased_name}: Option<{field_type_str}>,\n",
             ));
         }
     }
@@ -615,8 +779,12 @@ fn generate_enum(enum_model: &EnumModel) -> Result<String> {
     Ok(output)
 }
 
-fn generate_type_alias(type_alias: &TypeAliasModel) -> Result<String> {
+fn generate_type_alias(
+    type_alias: &TypeAliasModel,
+    lifetime_types: &HashSet<String>,
+) -> Result<String> {
     let mut output = String::new();
+    let has_lifetime = lifetime_types.contains(&type_alias.name);
 
     output.push_str(&generate_description_docs(
         &type_alias.description,
@@ -625,29 +793,49 @@ fn generate_type_alias(type_alias: &TypeAliasModel) -> Result<String> {
     ));
 
     output.push_str(&generate_custom_attrs(&type_alias.custom_attrs));
-    output.push_str(&format!(
-        "pub type {} = {};\n\n",
-        type_alias.name, type_alias.target_type
-    ));
+    let target = type_with_lifetime(&type_alias.target_type, lifetime_types);
+    if has_lifetime {
+        output.push_str(&format!(
+            "pub type {}<'a> = {};\n\n",
+            type_alias.name, target
+        ));
+    } else {
+        output.push_str(&format!(
+            "pub type {} = {};\n\n",
+            type_alias.name, target
+        ));
+    }
 
     Ok(output)
 }
 
 pub fn generate_rust_code(models: &[Model]) -> Result<String> {
+    let model_types: Vec<ModelType> = models
+        .iter()
+        .map(|m| ModelType::Struct(m.clone()))
+        .collect();
+    let lifetime_types = types_needing_lifetime(&model_types);
+
     let mut code = create_header();
 
     code.push_str("use serde::{Serialize, Deserialize};\n");
+    code.push_str("use serde_json::value::RawValue;\n");
     code.push_str("use uuid::Uuid;\n");
     code.push_str("use chrono::{DateTime, NaiveDate, Utc};\n\n");
 
     for model in models {
+        let has_lifetime = lifetime_types.contains(&model.name);
+
         code.push_str(&format!("/// {}\n", model.name));
         code.push_str("#[derive(Debug, Clone, Serialize, Deserialize)]\n");
-        code.push_str(&format!("pub struct {} {{\n", model.name));
+        if has_lifetime {
+            code.push_str(&format!("pub struct {}<'a> {{\n", model.name));
+        } else {
+            code.push_str(&format!("pub struct {} {{\n", model.name));
+        }
 
         for field in &model.fields {
             let field_type = match field.field_type.as_str() {
-                "String" => "String",
                 "f64" => "f64",
                 "i64" => "i64",
                 "bool" => "bool",
@@ -657,21 +845,29 @@ pub fn generate_rust_code(models: &[Model]) -> Result<String> {
                 _ => &field.field_type,
             };
 
+            let field_type_str = type_with_lifetime(field_type, &lifetime_types);
+            let needs_borrow = field_needs_borrow(field_type, &lifetime_types);
+
             let mut lowercased_name = to_snake_case(field.name.as_str());
             if is_reserved_word(&lowercased_name) {
                 lowercased_name = format!("r#{lowercased_name}")
             }
 
-            // Only add serde rename if the Rust field name differs from the original field name
+            if needs_borrow {
+                code.push_str("    #[serde(borrow)]\n");
+            }
+
             if lowercased_name != field.name {
                 code.push_str(&format!("    #[serde(rename = \"{}\")]\n", field.name));
             }
 
             if field.is_required {
-                code.push_str(&format!("    pub {lowercased_name}: {field_type},\n",));
+                code.push_str(&format!(
+                    "    pub {lowercased_name}: {field_type_str},\n",
+                ));
             } else {
                 code.push_str(&format!(
-                    "    pub {lowercased_name}: Option<{field_type}>,\n",
+                    "    pub {lowercased_name}: Option<{field_type_str}>,\n",
                 ));
             }
         }
